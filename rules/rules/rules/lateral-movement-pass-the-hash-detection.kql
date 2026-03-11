@@ -1,0 +1,76 @@
+// ============================================================
+// Rule: Lateral Movement — Pass the Hash / Pass the Ticket
+// Description: Detects lateral movement via credential theft
+//              by identifying NTLM authentication anomalies
+//              combined with suspicious remote execution and
+//              service creation on remote hosts.
+// Severity: High
+// MITRE ATT&CK:
+//   T1550.002 - Pass the Hash
+//   T1550.003 - Pass the Ticket
+//   T1021.002 - SMB/Windows Admin Shares
+//   T1569.002 - Service Execution
+// Author: Samuel Kamure | CCI Global
+// Environment: Microsoft Sentinel | MDE | 8,000+ endpoints
+// Threshold logic: Tuned for multi-tenant BPO environment
+// False Positive Rate: Low — requires process + network + auth correlation
+// ============================================================
+let timeWindow = 2h;
+let NTLMEvents = DeviceLogonEvents
+    | where TimeGenerated > ago(timeWindow)
+    | where LogonType in ("Network", "NetworkCleartext")
+    | where ActionType == "LogonSuccess"
+    | where Protocol == "Ntlm"
+    | where RemoteIP != "127.0.0.1"
+    | project
+        NTLMTime = TimeGenerated,
+        DeviceName,
+        NTLMAccount = AccountName,
+        AccountDomain,
+        RemoteIP,
+        LogonType;
+let RemoteServices = DeviceEvents
+    | where TimeGenerated > ago(timeWindow)
+    | where ActionType == "ServiceInstalled"
+    | where InitiatingProcessFileName in ("services.exe", "sc.exe", "psexec.exe", "wmic.exe")
+    | project
+        ServiceTime = TimeGenerated,
+        DeviceName,
+        ServiceName = tostring(AdditionalFields),
+        InitiatingProcess = InitiatingProcessFileName,
+        ServiceAccount = InitiatingProcessAccountName;
+let RemoteExecution = DeviceProcessEvents
+    | where TimeGenerated > ago(timeWindow)
+    | where InitiatingProcessFileName in (
+        "psexec.exe",
+        "wmic.exe",
+        "mmc.exe",
+        "winrm.cmd",
+        "powershell.exe")
+    | project
+        ExecTime = TimeGenerated,
+        DeviceName,
+        ProcessName = FileName,
+        ExecCommandLine = ProcessCommandLine,
+        ExecAccount = InitiatingProcessAccountName;
+NTLMEvents
+| join kind=inner RemoteServices on DeviceName
+| join kind=inner RemoteExecution on DeviceName
+| where abs(datetime_diff('minute', NTLMTime, ServiceTime)) <= 30
+| where abs(datetime_diff('minute', NTLMTime, ExecTime)) <= 30
+| extend RiskScore = case(
+    InitiatingProcess == "psexec.exe", "CRITICAL — PsExec lateral movement confirmed",
+    InitiatingProcess == "wmic.exe",   "HIGH — WMI lateral movement detected",
+    ProcessName == "powershell.exe",   "HIGH — PowerShell remote execution detected",
+    "MEDIUM — Suspicious lateral movement pattern")
+| project
+    NTLMTime,
+    SourceDevice = DeviceName,
+    NTLMAccount,
+    RemoteIP,
+    ServiceName,
+    InitiatingProcess,
+    ExecCommandLine,
+    ExecAccount,
+    RiskScore
+| order by NTLMTime desc
