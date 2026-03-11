@@ -1,0 +1,73 @@
+// ============================================================
+// Rule: Impossible Travel + MFA Manipulation + Privileged Action
+// Severity: Critical
+// MITRE ATT&CK: T1078, T1556, T1098
+// Author: Samuel Kamure | CCI Global
+// ============================================================
+let timeWindow = 1h;
+let impossibleSpeedKmh = 800;
+let SignIns = SigninLogs
+    | where TimeGenerated > ago(timeWindow)
+    | where ResultType == "0"
+    | where isnotempty(Location)
+    | project
+        TimeGenerated,
+        UserPrincipalName,
+        IPAddress,
+        Country = tostring(LocationDetails.countryOrRegion),
+        Latitude = todouble(LocationDetails.geoCoordinates.latitude),
+        Longitude = todouble(LocationDetails.geoCoordinates.longitude);
+let MFAChanges = AuditLogs
+    | where TimeGenerated > ago(timeWindow)
+    | where OperationName in (
+        "User registered security info",
+        "User deleted security info",
+        "User changed default security info")
+    | where Result == "success"
+    | extend UserPrincipalName = tostring(InitiatedBy.user.userPrincipalName)
+    | project MFAChangeTime = TimeGenerated, UserPrincipalName, MFAOperation = OperationName;
+let PrivilegedActions = AuditLogs
+    | where TimeGenerated > ago(timeWindow)
+    | where OperationName in (
+        "Add member to role",
+        "Add user",
+        "Reset user password",
+        "Add owner to application")
+    | where Result == "success"
+    | extend UserPrincipalName = tostring(InitiatedBy.user.userPrincipalName)
+    | project PrivActionTime = TimeGenerated, UserPrincipalName, PrivilegedOperation = OperationName;
+SignIns
+| join kind=inner (SignIns) on UserPrincipalName
+| where TimeGenerated < TimeGenerated1
+| extend
+    TimeDeltaHours = datetime_diff('minute', TimeGenerated1, TimeGenerated) / 60.0,
+    DistanceKm = geo_distance_2points(Longitude, Latitude, Longitude1, Latitude1) / 1000
+| extend SpeedKmh = DistanceKm / max_of(TimeDeltaHours, 0.01)
+| where SpeedKmh > impossibleSpeedKmh
+| where Country != Country1
+| project
+    UserPrincipalName,
+    FirstSignIn = TimeGenerated,
+    FirstCountry = Country,
+    FirstIP = IPAddress,
+    SecondSignIn = TimeGenerated1,
+    SecondCountry = Country1,
+    SecondIP = IPAddress1,
+    SpeedKmh = round(SpeedKmh, 0)
+| join kind=inner MFAChanges on UserPrincipalName
+| join kind=inner PrivilegedActions on UserPrincipalName
+| extend RiskScore = case(
+    SpeedKmh > 5000, "CRITICAL — Likely Automated Attack",
+    SpeedKmh > 2000, "HIGH — Probable Account Takeover",
+    "MEDIUM — Investigate Immediately")
+| project
+    UserPrincipalName,
+    FirstCountry,
+    FirstIP,
+    SecondCountry,
+    SecondIP,
+    SpeedKmh,
+    MFAOperation,
+    PrivilegedOperation,
+    RiskScore
+| order by SpeedKmh desc
