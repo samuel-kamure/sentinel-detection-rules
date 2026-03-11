@@ -1,0 +1,117 @@
+// ============================================================
+// Rule: Comprehensive Data Exfiltration Investigation Query
+// Description: 7-source correlated exfiltration detection covering
+//              USB, cloud upload, sensitive files, archives, and print
+// Severity: Critical
+// MITRE ATT&CK: T1048, T1567, T1052.001, T1114, T1560
+// Author: Samuel Kamure | CCI Global
+// Environment: Microsoft Sentinel | Purview | MDE | M365
+// ============================================================
+let TargetDevice = "HOSTNAME-HERE"; // Replace with target device name during investigation";
+let LookbackPeriod = 30d;
+let SuspiciousUploadDomains = dynamic([
+    "drive.google.com", "docs.google.com", "dropbox.com", "wetransfer.com",
+    "mega.nz", "mega.io", "mediafire.com", "sendspace.com", "anonfiles.com",
+    "onedrive.live.com", "1drv.ms", "icloud.com", "box.com", "box.net",
+    "pastebin.com", "ghostbin.com", "transfer.sh", "file.io", "gofile.io",
+    "github.com", "gitlab.com", "bitbucket.org",
+    "mail.google.com", "mail.yahoo.com", "outlook.live.com", "protonmail.com",
+    "tutanota.com", "web.telegram.org", "discord.com", "api.telegram.org"
+]);
+let SensitiveExtensions = dynamic([
+    ".xlsx", ".xls", ".csv", ".docx", ".doc", ".pdf", ".pptx", ".ppt",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bak", ".sql", ".mdb",
+    ".accdb", ".pst", ".ost", ".kdbx", ".key", ".pem", ".pfx"
+]);
+let USB_Events =
+    DeviceEvents
+    | where Timestamp > ago(LookbackPeriod)
+    | where DeviceName has TargetDevice
+    | where ActionType in ("UsbDriveMounted", "UsbDriveUnmounted", "RemovableStoragePolicyTriggered", "PnpDeviceConnected")
+    | extend Channel = "USB/Removable Media"
+    | project Timestamp, Channel, ActionType, DeviceName,
+        Detail = coalesce(AdditionalFields, ""),
+        FileName = "", FileSize = long(null), FolderPath = "",
+        ProcessName = InitiatingProcessFileName,
+        AccountName = InitiatingProcessAccountName;
+let USB_FileCopies =
+    DeviceFileEvents
+    | where Timestamp > ago(LookbackPeriod)
+    | where DeviceName has TargetDevice
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FolderPath matches regex @"^[D-Z]:\\" // non-C drive = likely removable
+        or FolderPath has_any ("removable", "usb", "mass storage")
+    | extend Channel = "File → Removable Drive"
+    | project Timestamp, Channel, ActionType, DeviceName,
+        Detail = strcat(FileName, " (", format_bytes(FileSize, 2), ")"),
+        FileName, FileSize, FolderPath,
+        ProcessName = InitiatingProcessFileName,
+        AccountName = InitiatingProcessAccountName;
+let CloudUpload_Network =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackPeriod)
+    | where DeviceName has TargetDevice
+    | where isnotempty(RemoteUrl)
+    | where RemoteUrl has_any (SuspiciousUploadDomains)
+    | extend Channel = "Cloud/Personal Upload Service"
+    | project Timestamp, Channel, ActionType, DeviceName,
+        Detail = RemoteUrl,
+        FileName = "", FileSize = long(null), FolderPath = "",
+        ProcessName = InitiatingProcessFileName,
+        AccountName = InitiatingProcessAccountName;
+let SensitiveFileAccess =
+    DeviceFileEvents
+    | where Timestamp > ago(LookbackPeriod)
+    | where DeviceName has TargetDevice
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed", "FileCopied")
+    | where FileName has_any (SensitiveExtensions)
+        or isnotempty(SensitivityLabel)
+    | extend Channel = iif(isnotempty(SensitivityLabel),
+        strcat("Sensitive File (", SensitivityLabel, ")"),
+        "Sensitive File Type")
+    | project Timestamp, Channel, ActionType, DeviceName,
+        Detail = strcat(FileName, " → ", FolderPath, " (", format_bytes(FileSize, 2), ")"),
+        FileName, FileSize, FolderPath,
+        ProcessName = InitiatingProcessFileName,
+        AccountName = InitiatingProcessAccountName;
+let LargeFileDownloads =
+    DeviceFileEvents
+    | where Timestamp > ago(LookbackPeriod)
+    | where DeviceName has TargetDevice
+    | where ActionType == "FileCreated"
+    | where isnotempty(FileOriginUrl)
+    | where FileSize > 10485760
+    | extend Channel = "Large File Download (from web)"
+    | project Timestamp, Channel, ActionType, DeviceName,
+        Detail = strcat(FileName, " from ", FileOriginUrl, " (", format_bytes(FileSize, 2), ")"),
+        FileName, FileSize, FolderPath,
+        ProcessName = InitiatingProcessFileName,
+        AccountName = InitiatingProcessAccountName;
+let ArchiveCreation =
+    DeviceFileEvents
+    | where Timestamp > ago(LookbackPeriod)
+    | where DeviceName has TargetDevice
+    | where ActionType == "FileCreated"
+    | where FileName endswith ".zip" or FileName endswith ".rar"
+        or FileName endswith ".7z" or FileName endswith ".tar.gz"
+    | extend Channel = "Archive Created (staging?)"
+    | project Timestamp, Channel, ActionType, DeviceName,
+        Detail = strcat(FileName, " (", format_bytes(FileSize, 2), ")"),
+        FileName, FileSize, FolderPath,
+        ProcessName = InitiatingProcessFileName,
+        AccountName = InitiatingProcessAccountName;
+let PrintEvents =
+    DeviceEvents
+    | where Timestamp > ago(LookbackPeriod)
+    | where DeviceName has TargetDevice
+    | where ActionType == "PrintJobEvent"
+    | extend Channel = "Print Job"
+    | project Timestamp, Channel, ActionType, DeviceName,
+        Detail = coalesce(AdditionalFields, ""),
+        FileName = "", FileSize = long(null), FolderPath = "",
+        ProcessName = InitiatingProcessFileName,
+        AccountName = InitiatingProcessAccountName;
+union USB_Events, USB_FileCopies, CloudUpload_Network,
+      SensitiveFileAccess, LargeFileDownloads, ArchiveCreation, PrintEvents
+| sort by Timestamp desc
+| project Timestamp, Channel, ActionType, Detail, FileName, FileSize, FolderPath, ProcessName, AccountName, DeviceName
